@@ -6,13 +6,14 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import networkx as nx
-import tiktoken
 from diskcache import Cache
 from pygments.lexers import guess_lexer_for_filename
 from pygments.token import Token
 from pygments.util import ClassNotFound
+from tqdm import tqdm
 
 from aider import models
 
@@ -61,19 +62,31 @@ def fname_to_components(fname, with_colon):
 
 class RepoMap:
     CACHE_VERSION = 1
-    ctags_cmd = ["ctags", "--fields=+S", "--extras=-F", "--output-format=json"]
+    ctags_cmd = [
+        "ctags",
+        "--fields=+S",
+        "--extras=-F",
+        "--output-format=json",
+        "--output-encoding=utf-8",
+    ]
     IDENT_CACHE_DIR = f".aider.ident.cache.v{CACHE_VERSION}"
     TAGS_CACHE_DIR = f".aider.tags.cache.v{CACHE_VERSION}"
+
+    ctags_disabled_reason = "ctags not initialized"
+
+    cache_missing = False
 
     def __init__(
         self,
         map_tokens=1024,
         root=None,
-        main_model=models.GPT4,
+        main_model=models.Model.strong_model(),
         io=None,
         repo_content_prefix=None,
+        verbose=False,
     ):
         self.io = io
+        self.verbose = verbose
 
         if not root:
             root = os.getcwd()
@@ -90,7 +103,7 @@ class RepoMap:
         else:
             self.use_ctags = False
 
-        self.tokenizer = tiktoken.encoding_for_model(main_model.name)
+        self.tokenizer = main_model.tokenizer
         self.repo_content_prefix = repo_content_prefix
 
     def get_repo_map(self, chat_files, other_files):
@@ -128,7 +141,7 @@ class RepoMap:
             files_listing = self.get_ranked_tags_map(chat_files, other_files)
             if files_listing:
                 num_tokens = self.token_count(files_listing)
-                if self.io:
+                if self.verbose:
                     self.io.tool_output(f"ctags map: {num_tokens/1024:.1f} k-tokens")
                 ctags_msg = " with selected ctags info"
                 return files_listing, ctags_msg
@@ -136,7 +149,7 @@ class RepoMap:
         files_listing = self.get_simple_files_map(other_files)
         ctags_msg = ""
         num_tokens = self.token_count(files_listing)
-        if self.io:
+        if self.verbose:
             self.io.tool_output(f"simple map: {num_tokens/1024:.1f} k-tokens")
         if num_tokens < self.max_map_tokens:
             return files_listing, ctags_msg
@@ -162,16 +175,28 @@ class RepoMap:
 
     def run_ctags(self, filename):
         # Check if the file is in the cache and if the modification time has not changed
-        file_mtime = os.path.getmtime(filename)
+        file_mtime = self.get_mtime(filename)
+        if file_mtime is None:
+            return []
+
         cache_key = filename
         if cache_key in self.TAGS_CACHE and self.TAGS_CACHE[cache_key]["mtime"] == file_mtime:
             return self.TAGS_CACHE[cache_key]["data"]
 
-        cmd = self.ctags_cmd + [filename]
+        cmd = self.ctags_cmd + [
+            f"--input-encoding={self.io.encoding}",
+            filename,
+        ]
         output = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode("utf-8")
-        output = output.splitlines()
+        output_lines = output.splitlines()
 
-        data = [json.loads(line) for line in output]
+        data = []
+        for line in output_lines:
+            try:
+                data.append(json.loads(line))
+            except json.decoder.JSONDecodeError as err:
+                self.io.tool_error(f"Error parsing ctags output: {err}")
+                self.io.tool_error(repr(line))
 
         # Update the cache
         self.TAGS_CACHE[cache_key] = {"mtime": file_mtime, "data": data}
@@ -180,29 +205,63 @@ class RepoMap:
 
     def check_for_ctags(self):
         try:
+            executable = self.ctags_cmd[0]
+            cmd = [executable, "--version"]
+            output = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode("utf-8")
+            output = output.lower()
+
+            cmd = " ".join(cmd)
+
+            if "universal ctags" not in output:
+                self.ctags_disabled_reason = f"{cmd} does not claim to be universal ctags"
+                return
+            if "+json" not in output:
+                self.ctags_disabled_reason = f"{cmd} does not list +json support"
+                return
+
             with tempfile.TemporaryDirectory() as tempdir:
                 hello_py = os.path.join(tempdir, "hello.py")
-                with open(hello_py, "w") as f:
+                with open(hello_py, "w", encoding="utf-8") as f:
                     f.write("def hello():\n    print('Hello, world!')\n")
                 self.run_ctags(hello_py)
-        except Exception:
-            return False
+        except FileNotFoundError:
+            self.ctags_disabled_reason = f"{executable} executable not found"
+            return
+        except Exception as err:
+            self.ctags_disabled_reason = f"error running universal-ctags: {err}"
+            return
+
         return True
 
     def load_tags_cache(self):
-        self.TAGS_CACHE = Cache(self.TAGS_CACHE_DIR)
+        path = Path(self.root) / self.TAGS_CACHE_DIR
+        if not path.exists():
+            self.cache_missing = True
+        self.TAGS_CACHE = Cache(path)
 
     def save_tags_cache(self):
         pass
 
     def load_ident_cache(self):
-        self.IDENT_CACHE = Cache(self.IDENT_CACHE_DIR)
+        path = Path(self.root) / self.IDENT_CACHE_DIR
+        if not path.exists():
+            self.cache_missing = True
+        self.IDENT_CACHE = Cache(path)
 
     def save_ident_cache(self):
         pass
 
+    def get_mtime(self, fname):
+        try:
+            return os.path.getmtime(fname)
+        except FileNotFoundError:
+            self.io.tool_error(f"File not found error: {fname}")
+
     def get_name_identifiers(self, fname, uniq=True):
-        file_mtime = os.path.getmtime(fname)
+        file_mtime = self.get_mtime(fname)
+        if file_mtime is None:
+            return set()
+
         cache_key = fname
         if cache_key in self.IDENT_CACHE and self.IDENT_CACHE[cache_key]["mtime"] == file_mtime:
             idents = self.IDENT_CACHE[cache_key]["data"]
@@ -216,10 +275,8 @@ class RepoMap:
         return idents
 
     def get_name_identifiers_uncached(self, fname):
-        try:
-            with open(fname, "r") as f:
-                content = f.read()
-        except UnicodeDecodeError:
+        content = self.io.read_text(fname)
+        if content is None:
             return list()
 
         try:
@@ -242,7 +299,17 @@ class RepoMap:
         fnames = set(chat_fnames).union(set(other_fnames))
         chat_rel_fnames = set()
 
-        for fname in sorted(fnames):
+        fnames = sorted(fnames)
+
+        if self.cache_missing:
+            fnames = tqdm(fnames)
+        self.cache_missing = False
+
+        for fname in fnames:
+            if not Path(fname).is_file():
+                self.io.tool_error(f"Repo-map can't include {fname}")
+                continue
+
             # dump(fname)
             rel_fname = os.path.relpath(fname, self.root)
 
